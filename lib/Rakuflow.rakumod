@@ -63,9 +63,8 @@ class JOB_INFO-actions {
 }
 
 multi run("bash", $script, $cwd, $job-name, $resource) {
-  my $log-out = "$cwd/qsub.o";
-  my $log-err = "$cwd/qsub.e";
-  say qq[Start job: $job-name];
+  my $log-out = "$cwd/qsub.out.log";
+  my $log-err = "$cwd/qsub.err.log";
   my $proc = run "bash", $script, :cwd($cwd), :out, :err;
   spurt $log-out, $proc.out.slurp;
   spurt $log-err, $proc.err.slurp;
@@ -75,8 +74,8 @@ multi run("bash", $script, $cwd, $job-name, $resource) {
 }
 
 multi run("qsub", $script, $cwd, $job-name, $resource) {
-  my $log-out = "$cwd/qsub.o";
-  my $log-err = "$cwd/qsub.e";
+  my $log-out = "$cwd/qsub.out.log";
+  my $log-err = "$cwd/qsub.err.log";
   my $resource-cmd = "";
   if $resource ~~ Hash {
     my $node-n = $resource<node> // 1;
@@ -88,21 +87,24 @@ multi run("qsub", $script, $cwd, $job-name, $resource) {
     $resource-cmd = "-l $resource-cmd";
   } elsif $*resource ~~ Str {
     $resource-cmd = "-l $*resource";
-  } 
+  }
   my $qsub-out = qqx[qsub $script $resource-cmd -N $job-name -d $cwd -o $log-out -e $log-err].trim;
-  say qq[Start job: $qsub-out for $job-name];
+  say "[PBS] Start job: $qsub-out for $job-name";
   my $job-id = ($qsub-out ~~ m/(\d+)\./)[0].Str;
 
   my $p = monitor-job($job-id);
-  my $s = monitor-file($log-out, $p);
+  my $o = monitor-file($log-out, $p);
+  my $e = monitor-file($log-err, $p);
   my $return-value;
   react {
     whenever $p -> $r {
       $return-value = $r;
-      done();
     }
-    whenever $s -> $l {
-      say $l;
+    whenever $o -> $l {
+      say $l.chomp;
+    }
+    whenever $e -> $l {
+      note $l.chomp;
     }
   }
   $return-value;
@@ -131,28 +133,29 @@ sub monitor-job($job-id) {
 
 sub monitor-file($file, $job-prom) {
   my $fh;
-  loop {
-    if ($file.IO.e) {
-      $fh = $file.IO.open(:r);
-      last;
-    }
-    sleep 1;
-  }
 
   my $supply = supply {
     loop {
-      while not $fh.eof {
-        emit $fh.get;
-      }
-      if $job-prom.status ~~ "Kept" {
-        sleep 10;
+      if not $fh {
+        $fh = $file.IO.open(:r) if ($file.IO.e);
+      } else {
         while not $fh.eof {
-          emit $fh.get;
+          if $fh.get -> $l {
+            emit $l;
+          }
         }
-        sleep 2;
-        done();
-      };
-      sleep 10;
+        if $job-prom.status ~~ "Kept" {
+          sleep 2;
+          while not $fh.eof {
+            if $fh.get -> $l {
+              emit $l;
+            }
+          }
+          sleep 1;
+          done();
+        };
+        sleep 10;
+      }
     }
   }
   return $supply
@@ -246,7 +249,7 @@ sub encode-job-info(%proc-info is copy) {
 }
 
 sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy = 'bash', :$process-name = $*process-name, :$resource = $*resource) is export {
-  my %proc-info = workdir => $workdir, code => $code, output => $output, export-to => $export-to;
+  my %proc-info = workdir => $workdir, code => $code;
   my $job_info = encode-job-info(%proc-info);
   my $cwd;
   my $hist := $*hist;
@@ -256,36 +259,44 @@ sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy =
 
     if $hist{$job_info} {
       $cwd = $hist{$job_info};
+      note "[$process-name] Resume proc: $job_info with CWD $cwd";
     } else {
       $cwd = prepare-workdir($workdir);
-      my $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
-
+      note "[$process-name] Start proc: $job_info with CWD $cwd";
+      my $proc;
+      $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
 
       unless $proc<exitcode> == 0 {
-        note "Error happend when run ...";
-        exit 1;
-      }
-
-      if $export-to {
-        my @output;
-        if $output ~~ Hash {
-          @output = %$output.values;
-        } else {
-          @output = @$output;
-        }
-        for @output -> $from {
-          if $from ~~ Path {
-            export-file("$cwd/$from", $export-to);
-          } elsif $from ~~ IO {
-            export-file("$from", $export-to);
-          }
-        }
+        note "Error happend when run: $process-name";
+        note "Job: $job_info";
+        note "============== Code =============";
+        note $code;
+        note "============== CWD ==============";
+        note $cwd;
+        note "============== More =============";
+        note $resource;
       }
 
       $hist{$job_info} = $cwd;
+      "$workdir/.history".IO.spurt(to-json(%$hist));
     }
 
     ## export the output
+    if $export-to {
+      my @output;
+      if $output ~~ Hash {
+        @output = %$output.values;
+      } else {
+        @output = @$output;
+      }
+      for @output -> $from {
+        if $from ~~ Path {
+          export-file("$cwd/$from", $export-to);
+        } elsif $from ~~ IO {
+          export-file("$from", $export-to);
+        }
+      }
+    }
 
     ## process output
     # TODO: Output the stdout
