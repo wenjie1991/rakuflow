@@ -222,6 +222,7 @@ sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy =
         note $cwd;
         note "============== More =============";
         note $resource;
+        return Any;
       } else {
         $lock.protect({
           my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
