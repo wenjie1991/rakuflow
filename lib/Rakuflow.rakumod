@@ -42,11 +42,13 @@ method new(:$version = 4) {
 
 class Path is Str is export {}
 
-Str.^add_method( 'Path', method () returns Path:D {#{{{
+Str.^add_method( 'Path', method () returns Path:D {
   return Path(self);
-} );#}}}
+} );
 
-## PBS run
+######
+#  PBS run  #
+######
 grammar JOB_INFO {
   token TOP { 'Job Id: '<job_id>\n<key-value>+\n* }
   token job_id { \N+ }
@@ -62,16 +64,6 @@ class JOB_INFO-actions {
   }
 }
 
-multi run("bash", $script, $cwd, $job-name, $resource) {
-  my $log-out = "$cwd/qsub.out.log";
-  my $log-err = "$cwd/qsub.err.log";
-  my $proc = run "bash", $script, :cwd($cwd), :out, :err;
-  spurt $log-out, $proc.out.slurp;
-  spurt $log-err, $proc.err.slurp;
-  $*ERR.print: $log-err.IO.slurp;
-  print $log-out.IO.slurp;
-  $proc.exitcode;
-}
 
 multi run("qsub", $script, $cwd, $job-name, $resource) {
   my $log-out = "$cwd/qsub.out.log";
@@ -92,117 +84,67 @@ multi run("qsub", $script, $cwd, $job-name, $resource) {
   say "[PBS] Start job: $qsub-out for $job-name";
   my $job-id = ($qsub-out ~~ m/(\d+)\./)[0].Str;
 
-  my $p = monitor-job($job-id);
-  my $o = monitor-file($log-out, $p);
-  my $e = monitor-file($log-err, $p);
   my $return-value;
-  react {
-    whenever $p -> $r {
-      $return-value = $r;
-    }
-    whenever $o -> $l {
-      say $l.chomp;
-    }
-    whenever $e -> $l {
-      note $l.chomp;
-    }
+  my $fh-o;
+  my $fh-e;
+
+  loop {
+    $return-value = monitor-job($job-id);
+    sleep 30;
+    monitor-file($fh-o, $log-out, $*OUT);
+    monitor-file($fh-e, $log-err, $*ERR);
+    last if $return-value;
   }
+
   $return-value;
 }
 
+sub monitor-file($fh is rw, $file, $s) {
+
+  if not $fh {
+    $fh = $file.IO.open(:r) if ($file.IO.e);
+    # say "File handle not ready";
+  } else {
+    # say "File handle ready";
+    # say so $fh.eof;
+    # say $fh;
+    while not $fh.eof {
+      # say "read line";
+      if $fh.get -> $l {
+        $s.say($l);
+      }
+    }
+  }
+}
+
 sub monitor-job($job-id) {
-  my $prom = Promise.start({
-    my $demo-qstat-out;
-    my $status;
-    my $job-info;
-    loop {
-      sleep 5;
-      $demo-qstat-out = qqx[qstat -f1 $job-id];
-      $job-info = JOB_INFO.parse($demo-qstat-out, :actions(JOB_INFO-actions)).made;
-      if so $job-info<job_state> eq ['C', 'E'].any {
-        $status = $job-info<exit_status>;
-        last;
-      } else {
-        sleep 1;
-      }
-    }
-    $status;
-  });
-  return $prom;
+  my $status;
+  # say "start monitor job";
+  # say "monitor job $job-id";
+  my $demo-qstat-out = qqx[qstat -f1 $job-id];
+  my $job-info = JOB_INFO.parse($demo-qstat-out, :actions(JOB_INFO-actions)).made;
+  if so $job-info<job_state> eq ['C', 'E'].any {
+    # say "job_finished $job-id";
+    $status = $job-info<exit_status>;
+  }
+  $status;
 }
 
-sub monitor-file($file, $job-prom) {
-  my $fh;
 
-  my $supply = supply {
-    loop {
-      if not $fh {
-        $fh = $file.IO.open(:r) if ($file.IO.e);
-      } else {
-        while not $fh.eof {
-          if $fh.get -> $l {
-            emit $l;
-          }
-        }
-        if $job-prom.status ~~ "Kept" {
-          sleep 2;
-          while not $fh.eof {
-            if $fh.get -> $l {
-              emit $l;
-            }
-          }
-          sleep 1;
-          done();
-        };
-        sleep 10;
-      }
-    }
-  }
-  return $supply
+######
+#  Bash run  #
+######
+
+multi run("bash", $script, $cwd, $job-name, $resource) {
+  my $log-out = "$cwd/qsub.out.log";
+  my $log-err = "$cwd/qsub.err.log";
+  my $proc = run "bash", $script, :cwd($cwd), :out, :err;
+  spurt $log-out, $proc.out.slurp;
+  spurt $log-err, $proc.err.slurp;
+  $*ERR.print: $log-err.IO.slurp;
+  print $log-out.IO.slurp;
+  $proc.exitcode;
 }
-
-class Process is export {#{{{
-  has Hash $.input;
-  has Hash $.output;
-  has Str $.script;
-  has Str $.workdir = Any;
-  has Str $.code = "";
-  has Str $.exportDir = [];
-  has Hash $.config;
-
-  submethod TWEAK {
-    unless $!workdir {
-      $!workdir = $!config<workdir> // $*CWD;
-    }
-  }
-
-  method run(*%input) {
-    my $cwd = prepare-workdir($!workdir);
-    my $code = process_template($!code, %input, $!config);
-    Promise.start({
-      run-code($code, $!workdir);
-      $!output.kv.map( -> $k, $v {
-        # TODO define File type
-        if $v ~~ Str {
-          "$cwd/$k".IO
-        } elsif $v ~~ IO {
-          $k.IO
-        } else {
-          $k
-        }
-      });
-    });
-  }
-
-  sub process_template($template is copy, %input, %config) {
-    $template ~~ s:g/\{\{(\w+)\}\}/$(extract_param($0, %input, %config))/;
-    return $template;
-  }
-
-  sub extract_param($query, %param, %config) {
-    %param{$query} // %config{$query}
-  }
-}#}}}
 
 sub get-new_uuid() is export {
   return UUID.new.Str.substr(0, 5);
@@ -235,27 +177,32 @@ sub export-file($from, $export-to) is export {
 }
 
 sub encode-job-info(%proc-info is copy) {
-  if %proc-info<output> ~~ Hash {
-    %proc-info<output> = %proc-info<output>.map({
-      say $_;
-      if $_ ~~ IO {
-        $_ ~ ".IO" ~ {$_.changed.DataTime}
-      } else {
-        $_
-      }
-    })
-  }
+  # if %proc-info<output> ~~ Hash {
+    # %proc-info<output> = %proc-info<output>.map({
+      # if $_ ~~ IO {
+        # $_ ~ ".IO" ~ {$_.changed.DataTime}
+      # } else {
+        # $_
+      # }
+    # })
+  # }
   MD5(%proc-info.perl).hex
 }
+
 
 sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy = 'bash', :$process-name = $*process-name, :$resource = $*resource) is export {
   my %proc-info = workdir => $workdir, code => $code;
   my $job_info = encode-job-info(%proc-info);
   my $cwd;
-  my $hist := $*hist;
+  my $hist;
+  my $lock := $*lock;
+  $lock.protect({
+    $hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
+  });
+
   $proc-bin = $*proc-bin if $*proc-bin;
 
-  my $prom = Promise.start({
+  start {
 
     if $hist{$job_info} {
       $cwd = $hist{$job_info};
@@ -266,7 +213,7 @@ sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy =
       my $proc;
       $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
 
-      unless $proc<exitcode> == 0 {
+      if $proc<exitcode> != 0 {
         note "Error happend when run: $process-name";
         note "Job: $job_info";
         note "============== Code =============";
@@ -275,10 +222,13 @@ sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy =
         note $cwd;
         note "============== More =============";
         note $resource;
+      } else {
+        $lock.protect({
+          my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
+          %hist{$job_info} = $cwd;
+          ".history".IO.spurt(to-json(%hist));
+        });
       }
-
-      $hist{$job_info} = $cwd;
-      "$workdir/.history".IO.spurt(to-json(%$hist));
     }
 
     ## export the output
@@ -309,9 +259,49 @@ sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy =
         $_ ~~ Path ?? "$cwd/$_".IO !! $_
       }).Array;
     }
-  });
-
-  return $prom;
+  }
 }
 
+
+class Process is export {#{{{
+  has Hash $.input;
+  has Hash $.output;
+  has Str $.script;
+  has Str $.workdir = Any;
+  has Str $.code = "";
+  has Str $.exportDir = [];
+  has Hash $.config;
+
+  submethod TWEAK {
+    unless $!workdir {
+      $!workdir = $!config<workdir> // $*CWD;
+    }
+  }
+
+  method run(*%input) {
+    my $cwd = prepare-workdir($!workdir);
+    my $code = process_template($!code, %input, $!config);
+    Promise.start({
+      run-code($code, $!workdir);
+      $!output.kv.map( -> $k, $v {
+        if $v ~~ Str {
+          "$cwd/$k".IO
+        } elsif $v ~~ IO {
+          $k.IO
+        } else {
+          $k
+        }
+      });
+    });
+  }
+
+  sub process_template($template is copy, %input, %config) {
+    $template ~~ s:g/\{\{(\w+)\}\}/$(extract_param($0, %input, %config))/;
+    return $template;
+  }
+
+  sub extract_param($query, %param, %config) {
+    %param{$query} // %config{$query}
+  }
+}#}}}
 
