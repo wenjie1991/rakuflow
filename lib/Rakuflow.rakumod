@@ -137,7 +137,6 @@ sub monitor-job($job-id) {
 ######
 #  Bash run  #
 ######
-
 multi run("bash", $script, $cwd, $job-name, $resource) {
   my $log-out = "$cwd/qsub.out.log";
   my $log-err = "$cwd/qsub.err.log";
@@ -181,179 +180,181 @@ sub export-file($from, $export-to) is export {
 
 sub encode-job-info($proc-info is copy) {
   # if %proc-info<output> ~~ Hash {
-    # %proc-info<output> = %proc-info<output>.map({
-      # if $_ ~~ IO {
-        # $_ ~ ".IO" ~ {$_.changed.DataTime}
-        # } else {
-          # $_
-          # }
-          # })
-          # }
-          MD5($proc-info.perl).hex
+  #   %proc-info<output> = %proc-info<output>.map({
+  #     if $_ ~~ IO {
+  #       $_ ~ ".IO" ~ {$_.changed.DataTime}
+  #     } else {
+  #       $_
+  #     }
+  #   })
+  # }
+  MD5($proc-info.perl).hex
+}
+
+
+sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-bin = "bash", :$process-name = $*process-name, :$resource = $*resource) is export {
+  my $proc-info = ($workdir, $code);
+  my $job_info = encode-job-info($proc-info);
+  my $cwd;
+  my $hist;
+  $lock.protect({
+    $hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
+  });
+
+  start {
+
+    if $hist{$job_info} {
+      $cwd = $hist{$job_info};
+      note "[$process-name] Resume proc: $job_info with CWD $cwd";
+    } else {
+      # say $proc-info;
+      $cwd = prepare-workdir($workdir);
+      note "[$process-name] Start proc: $job_info with CWD $cwd";
+      my $proc;
+      $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
+
+      if $proc<exitcode> != 0 {
+        note "Error happend when run: $process-name";
+        note "Job: $job_info";
+        note "============== Code =============";
+        note $code;
+        note "============== CWD ==============";
+        note $cwd;
+        note "============== More =============";
+        note $resource;
+        return Any;
+      } else {
+        $lock.protect({
+          my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
+          %hist{$job_info} = $cwd;
+          ".history".IO.spurt(to-json(%hist));
+        });
+      }
+    }
+
+    ## export the output
+    if $export-to {
+      my @output;
+      if $output ~~ Hash {
+        @output = %$output.values;
+      } else {
+        @output = @$output;
+      }
+      for @output -> $from {
+        if $from ~~ Path {
+          export-file("$cwd/$from", $export-to);
+        } elsif $from ~~ IO {
+          export-file("$from", $export-to);
         }
+      }
+    }
+
+    ## process output
+    # TODO: Output the stdout
+    if $output ~~ Hash {
+      %$output.map({
+        $_.key => $_.value ~~ Path ?? "$cwd/{$_.value}".IO !! $_.value
+      }).Hash;
+    } else {
+      @$output.map({
+        $_ ~~ Path ?? "$cwd/$_".IO !! $_
+      }).Array;
+    }
+  }
+}
 
 
-        sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-bin = "bash", :$process-name = $*process-name, :$resource = $*resource) is export {
-          my $proc-info = ($workdir, $code);
-          my $job_info = encode-job-info($proc-info);
-          my $cwd;
-          my $hist;
-          $lock.protect({
-            $hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
-          });
+class Processes is export {
+  has %.processes;
+  has %.proc-conf;
+  has %.global-conf;
+  has $!lock = Lock.new;
 
-          start {
+  method from-config() {
+    # TODO: get config from Hash
+  }
 
-            if $hist{$job_info} {
-              $cwd = $hist{$job_info};
-              note "[$process-name] Resume proc: $job_info with CWD $cwd";
-            } else {
-              # say $proc-info;
-              $cwd = prepare-workdir($workdir);
-              note "[$process-name] Start proc: $job_info with CWD $cwd";
-              my $proc;
-              $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
+  method from-file() {
+    # TODO: get process config from file (json, yaml...)
+  }
 
-              if $proc<exitcode> != 0 {
-                note "Error happend when run: $process-name";
-                note "Job: $job_info";
-                note "============== Code =============";
-                note $code;
-                note "============== CWD ==============";
-                note $cwd;
-                note "============== More =============";
-                note $resource;
-                return Any;
-              } else {
-                $lock.protect({
-                  my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
-                  %hist{$job_info} = $cwd;
-                  ".history".IO.spurt(to-json(%hist));
-                });
-              }
-            }
+  method add($proc-name, %proc-conf is copy) {
+    %proc-conf<process-name> = $proc-name unless %proc-conf<process-name>;
+    %proc-conf<env> = Hash.new unless %proc-conf<env>;
+    %.proc-conf{$proc-name} = %proc-conf;
+  }
+  
+  method modify($proc-name, %conf-modify) {
+    my %proc-conf = %.proc-conf{$proc-name};
+    for %conf-modify.kv {
+      %proc-conf{$^a} = $^b;
+    }
+    %.proc-conf{$proc-name} = %proc-conf;
+  }
 
-            ## export the output
-            if $export-to {
-              my @output;
-              if $output ~~ Hash {
-                @output = %$output.values;
-              } else {
-                @output = @$output;
-              }
-              for @output -> $from {
-                if $from ~~ Path {
-                  export-file("$cwd/$from", $export-to);
-                } elsif $from ~~ IO {
-                  export-file("$from", $export-to);
-                }
-              }
-            }
+  method rm($proc-name) {
+    %.process{$proc-name} :delete;
+    %.proc-conf{$proc-name} :delete;
+  }
 
-            ## process output
-            # TODO: Output the stdout
-            if $output ~~ Hash {
-              %$output.map({
-                $_.key => $_.value ~~ Path ?? "$cwd/{$_.value}".IO !! $_.value
-              }).Hash;
-            } else {
-              @$output.map({
-                $_ ~~ Path ?? "$cwd/$_".IO !! $_
-              }).Array;
-            }
-          }
+  method new(*%global-conf) {
+    self.bless( global-conf => %global-conf );
+  }
+
+  multi method run($proc-name, @input = Array.new, %conf = Hash.new) {
+    my @input-name = %.proc-conf{$proc-name}<input>.Array;
+    my %proc-conf = (%.proc-conf{$proc-name}.Hash, %conf).Hash;
+    my %input = @input-name Z=> @input;
+    # say @input-name;
+
+    self!run-process(%proc-conf, %input);
+  }
+
+  multi method run($proc-name, %input = Hash.new, %conf = Hash.new) {
+    my %proc-conf = (%.proc-conf{$proc-name}.Hash, %conf).Hash;
+
+    self!run-process(%proc-conf, %input);
+  }
+
+  
+  method !run-process(%proc-conf, %input) {
+    my %*env = (%proc-conf<env>.Hash, %input).Hash;
+
+    my $template = %proc-conf<code>;
+    my $code = process-template($template, %*env);
+
+    my $output = %proc-conf<output>;
+    if $output ~~ Hash {
+      for %$output.kv {
+        if $^b ~~ Block {
+          %$output{$^a} = $^b();
         }
+      }
+    } else {
+      $output = @$output.map({ 
+        $_ ~~ Block ?? $_() !! $_
+      }).Array;
+    }
+
+    process(
+      $!lock,
+      workdir      => %proc-conf<workdir>      || %.global-conf<workdir>,
+      code         => $code,
+      output       => $output                  || Any,
+      proc-bin     => %proc-conf<proc-bin>     || %.global-conf<proc-bin> || 'bash',
+      resource     => %proc-conf<resource>     || %.global-conf<resource>,
+      process-name => %proc-conf<process-name>,
+      export-to    => %proc-conf<export-to>    || %.global-conf<export-to>,
+    );
+  }
 
 
-        class Processes is export {
-          has %.processes;
-          has %.proc-conf;
-          has %.global-conf;
-          has $!lock = Lock.new;
-
-          method !run-process(%proc-conf, %input) {
-            my %*env = (%proc-conf<env>.Hash, %input).Hash;
-
-            my $template = %proc-conf<code>;
-            my $code = process-template($template, %*env);
-
-            my $output = %proc-conf<output>;
-            if $output ~~ Hash {
-              for %$output.kv {
-                if $^b ~~ Block {
-                  %$output{$^a} = $^b();
-                }
-              }
-            } else {
-              $output = @$output.map({ 
-                $_ ~~ Block ?? $_() !! $_
-              }).Array;
-            }
-
-            process(
-              $!lock,
-              workdir      => %proc-conf<workdir>      || %.global-conf<workdir>,
-              code         => $code,
-              output       => $output                  || Any,
-              proc-bin     => %proc-conf<proc-bin>     || %.global-conf<proc-bin> || 'bash',
-              resource     => %proc-conf<resource>     || %.global-conf<resource>,
-              process-name => %proc-conf<process-name>,
-              export-to    => %proc-conf<export-to>    || %.global-conf<export-to>,
-            );
-          }
-
-          multi method run($proc-name, @input) {
-            my @input-name = %.proc-conf{$proc-name}<input>.Array;
-            my %proc-conf = %.proc-conf{$proc-name};
-            my %input = @input-name Z=> @input;
-            # say @input-name;
-
-            self!run-process(%proc-conf, %input);
-          }
-
-          multi method run($proc-name, %input) {
-            my %proc-conf = %.proc-conf{$proc-name};
-
-            self!run-process(%proc-conf, %input);
-          }
-
-          method add($proc-name, %proc-conf is copy) {
-            %proc-conf<process-name> = $proc-name unless %proc-conf<process-name>;
-            %proc-conf<env> = Hash.new unless %proc-conf<env>;
-            %.proc-conf{$proc-name} = %proc-conf;
-          }
-
-          method modify($proc-name, %conf-modify) {
-            my %proc-conf = %.proc-conf{$proc-name};
-            for %conf-modify.kv {
-              %proc-conf{$^a} = $^b;
-            }
-            %.proc-conf{$proc-name} = %proc-conf;
-          }
-
-          method rm($proc-name) {
-            %.process{$proc-name} :delete;
-            %.proc-conf{$proc-name} :delete;
-          }
-
-          method new(*%global-conf) {
-            self.bless( global-conf => %global-conf );
-          }
-
-          method from-config() {
-            # TODO: get config from Hash
-          }
-
-          method from-file() {
-            # TODO: get process config from file (json, yaml...)
-          }
-
-          sub process-template($template is copy, %input) {
-            # $template ~~ s:g/\#\((\w+)\)/%input{$0}/;
-            for %input.keys -> $key {
-              # $template ~~ s:g/ \#\(?: <$key>: \)?: /%input{$key}/;
-              $template ~~ s:g/ \$<$key>/%input{$key}/;
-            }
-            return $template;
-          }
-        }
+  sub process-template($template is copy, %input) {
+    # $template ~~ s:g/\#\((\w+)\)/%input{$0}/;
+    for %input.keys -> $key {
+      # $template ~~ s:g/ \#\(?: <$key>: \)?: /%input{$key}/;
+      $template ~~ s:g/ \$<$key>/%input{$key}/;
+    }
+    return $template;
+  }
+}
