@@ -5,39 +5,42 @@ unit module Rakuflow;
 use JSON::Fast;
 use Gcrypt::Simple :MD5;
 
+# $*ERR.out-buffer = False;
+# $*OUT.out-buffer = False;
+
 our $*process-name is export;
 
 class UUID {
-    has $.bytes;
-    has $.version;
-method new(:$version = 4) {
-        if $version == 4 {
-            my @bytes = (0..255).roll(16);
+  has $.bytes;
+  has $.version;
+  method new(:$version = 4) {
+    if $version == 4 {
+      my @bytes = (0..255).roll(16);
 
-            #variant
-            @bytes[8] +|= 0b10000000;
-            @bytes[8] +&= 0b10111111;
+      #variant
+      @bytes[8] +|= 0b10000000;
+      @bytes[8] +&= 0b10111111;
 
-            #version
-            @bytes[6] +|= 0b01000000;
-            @bytes[6] +&= 0b01001111;
+      #version
+      @bytes[6] +|= 0b01000000;
+      @bytes[6] +&= 0b01001111;
 
-            self.bless(:bytes(buf8.new(@bytes)), :$version);
-        }
-        else {
-            die "UUID version $version not supported.";
-        }
+      self.bless(:bytes(buf8.new(@bytes)), :$version);
     }
-
-    method Str {
-        (:256[$.bytes.values].fmt("%32.32x")
-            ~~ /(........)(....)(....)(....)(............)/)
-            .join("-");
+    else {
+      die "UUID version $version not supported.";
     }
+  }
 
-    method Blob {
-        $.bytes;
-    }
+  method Str {
+    (:256[$.bytes.values].fmt("%32.32x")
+    ~~ /(........)(....)(....)(....)(............)/)
+    .join("-");
+  }
+
+  method Blob {
+    $.bytes;
+  }
 }
 
 class Path is Str is export {}
@@ -72,9 +75,9 @@ multi run("qsub", $script, $cwd, $job-name, $resource) {
   if $resource ~~ Hash {
     my $node-n = $resource<node> // 1;
     $resource-cmd = $resource.kv.map( -> $k, $v {
-        when $k eq "cpu" { qq[nodes\={$node-n}\:ppn\={$v}] }
-        when $k eq "memory" { qq[mem\={$v}]}
-        when $k eq "time" { qq[walltime\={$v}] }
+      when $k eq "cpu" { qq[nodes\={$node-n}\:ppn\={$v}] }
+      when $k eq "memory" { qq[mem\={$v}]}
+      when $k eq "time" { qq[walltime\={$v}] }
     }).join(",");
     $resource-cmd = "-l $resource-cmd";
   } elsif $*resource ~~ Str {
@@ -176,133 +179,181 @@ sub export-file($from, $export-to) is export {
   qqx[ln -s $from $to];
 }
 
-sub encode-job-info(%proc-info is copy) {
+sub encode-job-info($proc-info is copy) {
   # if %proc-info<output> ~~ Hash {
     # %proc-info<output> = %proc-info<output>.map({
       # if $_ ~~ IO {
         # $_ ~ ".IO" ~ {$_.changed.DataTime}
-      # } else {
-        # $_
-      # }
-    # })
-  # }
-  MD5(%proc-info.perl).hex
-}
-
-
-sub process(:$workdir, :$code, :$output, :$export-to = Any, :$proc-bin is copy = 'bash', :$process-name = $*process-name, :$resource = $*resource) is export {
-  my %proc-info = workdir => $workdir, code => $code;
-  my $job_info = encode-job-info(%proc-info);
-  my $cwd;
-  my $hist;
-  my $lock := $*lock;
-  $lock.protect({
-    $hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
-  });
-
-  $proc-bin = $*proc-bin if $*proc-bin;
-
-  start {
-
-    if $hist{$job_info} {
-      $cwd = $hist{$job_info};
-      note "[$process-name] Resume proc: $job_info with CWD $cwd";
-    } else {
-      $cwd = prepare-workdir($workdir);
-      note "[$process-name] Start proc: $job_info with CWD $cwd";
-      my $proc;
-      $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
-
-      if $proc<exitcode> != 0 {
-        note "Error happend when run: $process-name";
-        note "Job: $job_info";
-        note "============== Code =============";
-        note $code;
-        note "============== CWD ==============";
-        note $cwd;
-        note "============== More =============";
-        note $resource;
-        return Any;
-      } else {
-        $lock.protect({
-          my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
-          %hist{$job_info} = $cwd;
-          ".history".IO.spurt(to-json(%hist));
-        });
-      }
-    }
-
-    ## export the output
-    if $export-to {
-      my @output;
-      if $output ~~ Hash {
-        @output = %$output.values;
-      } else {
-        @output = @$output;
-      }
-      for @output -> $from {
-        if $from ~~ Path {
-          export-file("$cwd/$from", $export-to);
-        } elsif $from ~~ IO {
-          export-file("$from", $export-to);
+        # } else {
+          # $_
+          # }
+          # })
+          # }
+          MD5($proc-info.perl).hex
         }
-      }
-    }
-
-    ## process output
-    # TODO: Output the stdout
-    if $output ~~ Hash {
-      %$output.map({
-        $_.key => $_.value ~~ Path ?? "$cwd/{$_.value}".IO !! $_.value
-      }).Hash;
-    } else {
-      @$output.map({
-        $_ ~~ Path ?? "$cwd/$_".IO !! $_
-      }).Array;
-    }
-  }
-}
 
 
-class Process is export {#{{{
-  has Hash $.input;
-  has Hash $.output;
-  has Str $.script;
-  has Str $.workdir = Any;
-  has Str $.code = "";
-  has Str $.exportDir = [];
-  has Hash $.config;
+        sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-bin = "bash", :$process-name = $*process-name, :$resource = $*resource) is export {
+          my $proc-info = ($workdir, $code);
+          my $job_info = encode-job-info($proc-info);
+          my $cwd;
+          my $hist;
+          $lock.protect({
+            $hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
+          });
 
-  submethod TWEAK {
-    unless $!workdir {
-      $!workdir = $!config<workdir> // $*CWD;
-    }
-  }
+          start {
 
-  method run(*%input) {
-    my $cwd = prepare-workdir($!workdir);
-    my $code = process_template($!code, %input, $!config);
-    Promise.start({
-      run-code($code, $!workdir);
-      $!output.kv.map( -> $k, $v {
-        if $v ~~ Str {
-          "$cwd/$k".IO
-        } elsif $v ~~ IO {
-          $k.IO
-        } else {
-          $k
+            if $hist{$job_info} {
+              $cwd = $hist{$job_info};
+              note "[$process-name] Resume proc: $job_info with CWD $cwd";
+            } else {
+              # say $proc-info;
+              $cwd = prepare-workdir($workdir);
+              note "[$process-name] Start proc: $job_info with CWD $cwd";
+              my $proc;
+              $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
+
+              if $proc<exitcode> != 0 {
+                note "Error happend when run: $process-name";
+                note "Job: $job_info";
+                note "============== Code =============";
+                note $code;
+                note "============== CWD ==============";
+                note $cwd;
+                note "============== More =============";
+                note $resource;
+                return Any;
+              } else {
+                $lock.protect({
+                  my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
+                  %hist{$job_info} = $cwd;
+                  ".history".IO.spurt(to-json(%hist));
+                });
+              }
+            }
+
+            ## export the output
+            if $export-to {
+              my @output;
+              if $output ~~ Hash {
+                @output = %$output.values;
+              } else {
+                @output = @$output;
+              }
+              for @output -> $from {
+                if $from ~~ Path {
+                  export-file("$cwd/$from", $export-to);
+                } elsif $from ~~ IO {
+                  export-file("$from", $export-to);
+                }
+              }
+            }
+
+            ## process output
+            # TODO: Output the stdout
+            if $output ~~ Hash {
+              %$output.map({
+                $_.key => $_.value ~~ Path ?? "$cwd/{$_.value}".IO !! $_.value
+              }).Hash;
+            } else {
+              @$output.map({
+                $_ ~~ Path ?? "$cwd/$_".IO !! $_
+              }).Array;
+            }
+          }
         }
-      });
-    });
-  }
 
-  sub process_template($template is copy, %input, %config) {
-    $template ~~ s:g/\{\{(\w+)\}\}/$(extract_param($0, %input, %config))/;
-    return $template;
-  }
 
-  sub extract_param($query, %param, %config) {
-    %param{$query} // %config{$query}
-  }
-}#}}}
+        class Processes is export {
+          has %.processes;
+          has %.proc-conf;
+          has %.global-conf;
+          has $!lock = Lock.new;
 
+          method !run-process(%proc-conf, %input) {
+            my %*env = (%proc-conf<env>.Hash, %input).Hash;
+
+            my $template = %proc-conf<code>;
+            my $code = process-template($template, %*env);
+
+            my $output = %proc-conf<output>;
+            if $output ~~ Hash {
+              for %$output.kv {
+                if $^b ~~ Block {
+                  %$output{$^a} = $^b();
+                }
+              }
+            } else {
+              $output = @$output.map({ 
+                $_ ~~ Block ?? $_() !! $_
+              }).Array;
+            }
+
+            process(
+              $!lock,
+              workdir      => %proc-conf<workdir>      || %.global-conf<workdir>,
+              code         => $code,
+              output       => $output                  || Any,
+              proc-bin     => %proc-conf<proc-bin>     || %.global-conf<proc-bin> || 'bash',
+              resource     => %proc-conf<resource>     || %.global-conf<resource>,
+              process-name => %proc-conf<process-name>,
+              export-to    => %proc-conf<export-to>    || %.global-conf<export-to>,
+            );
+          }
+
+          multi method run($proc-name, @input) {
+            my @input-name = %.proc-conf{$proc-name}<input>.Array;
+            my %proc-conf = %.proc-conf{$proc-name};
+            my %input = @input-name Z=> @input;
+            # say @input-name;
+
+            self!run-process(%proc-conf, %input);
+          }
+
+          multi method run($proc-name, %input) {
+            my %proc-conf = %.proc-conf{$proc-name};
+
+            self!run-process(%proc-conf, %input);
+          }
+
+          method add($proc-name, %proc-conf is copy) {
+            %proc-conf<process-name> = $proc-name unless %proc-conf<process-name>;
+            %proc-conf<env> = Hash.new unless %proc-conf<env>;
+            %.proc-conf{$proc-name} = %proc-conf;
+          }
+
+          method modify($proc-name, %conf-modify) {
+            my %proc-conf = %.proc-conf{$proc-name};
+            for %conf-modify.kv {
+              %proc-conf{$^a} = $^b;
+            }
+            %.proc-conf{$proc-name} = %proc-conf;
+          }
+
+          method rm($proc-name) {
+            %.process{$proc-name} :delete;
+            %.proc-conf{$proc-name} :delete;
+          }
+
+          method new(*%global-conf) {
+            self.bless( global-conf => %global-conf );
+          }
+
+          method from-config() {
+            # TODO: get config from Hash
+          }
+
+          method from-file() {
+            # TODO: get process config from file (json, yaml...)
+          }
+
+          sub process-template($template is copy, %input) {
+            # $template ~~ s:g/\#\((\w+)\)/%input{$0}/;
+            for %input.keys -> $key {
+              # $template ~~ s:g/ \#\(?: <$key>: \)?: /%input{$key}/;
+              $template ~~ s:g/ \$<$key>/%input{$key}/;
+            }
+            return $template;
+          }
+        }
