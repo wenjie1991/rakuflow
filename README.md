@@ -19,7 +19,7 @@ Compared to existing tools:
 - Parallelism, thanks to the excellent parallelism/asynchronous/concurrency features of Raku, tasks can run parallelly based on your proposal.
 
 ## Support platforms:
-- Local bash
+- Local Shell
 - PBS cluster
 - Slurm cluster (under development)
 
