@@ -43,7 +43,11 @@ class UUID {
   }
 }
 
-class Path is Str is export {}
+class Path is Str is export {
+  method Path {
+    return self;
+  }
+}
 
 Str.^add_method( 'Path', method () returns Path:D {
   return Path(self);
@@ -251,15 +255,17 @@ sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-
 
     ## process output
     # TODO: Output the stdout
+    my $output-data;
     if $output ~~ Hash {
-      %$output.map({
+      $output-data = %$output.map({
         $_.key => $_.value ~~ Path ?? "$cwd/{$_.value}".IO !! $_.value
       }).Hash;
     } else {
-      @$output.map({
+      $output-data = @$output.map({
         $_ ~~ Path ?? "$cwd/$_".IO !! $_
       }).Array;
     }
+    $output-data
   }
 }
 
@@ -297,7 +303,11 @@ class Processes is export {
     %.proc-conf{$proc-name} :delete;
   }
 
-  method new(*%global-conf) {
+  multi method new(*%global-conf) {
+    self.bless( global-conf => %global-conf );
+  }
+
+  multi method new(%global-conf) {
     self.bless( global-conf => %global-conf );
   }
 
@@ -318,23 +328,24 @@ class Processes is export {
 
   
   method !run-process(%proc-conf, %input) {
-    my %*env = (%proc-conf<env>.Hash, %input).Hash;
+    my %env = (%.global-conf.Hash, %proc-conf<env>.Hash, %input).Hash;
 
     my $template = %proc-conf<code>;
-    my $code = process-template($template, %*env);
+    my $code = parse-code-template($template, %env);
 
     my $output = %proc-conf<output>;
     if $output ~~ Hash {
       for %$output.kv {
-        if $^b ~~ Block {
-          %$output{$^a} = $^b();
-        }
+        %$output{$^a} = parse-io-template($^b, %env);
       }
     } else {
       $output = @$output.map({ 
-        $_ ~~ Block ?? $_() !! $_
+        parse-io-template($_, %env)
       }).Array;
     }
+
+    my $export-to = %proc-conf<export-to> || %.global-conf<export-to>;
+    $export-to = parse-io-template($export-to, %env) if $export-to;
 
     process(
       $!lock,
@@ -344,12 +355,22 @@ class Processes is export {
       proc-bin     => %proc-conf<proc-bin>     || %.global-conf<proc-bin> || 'bash',
       resource     => %proc-conf<resource>     || %.global-conf<resource>,
       process-name => %proc-conf<process-name>,
-      export-to    => %proc-conf<export-to>    || %.global-conf<export-to>,
+      export-to    => $export-to
     );
   }
 
+  sub parse-io-template($template, %env) {
+    my $template-copy = $template;
+    for %env.keys -> $key {
+      $template-copy ~~ s:g/ \<<$key>\>/%env{$key}/;
+    }
+    if $template ~~ Path {
+      $template-copy = $template-copy.Path;
+    } 
+    return $template-copy;
+  }
 
-  sub process-template($template is copy, %input) {
+  sub parse-code-template($template is copy, %input) {
     # $template ~~ s:g/\#\((\w+)\)/%input{$0}/;
     for %input.keys -> $key {
       # $template ~~ s:g/ \#\(?: <$key>: \)?: /%input{$key}/;
