@@ -8,6 +8,9 @@ use Gcrypt::Simple :MD5;
 # $*ERR.out-buffer = False;
 # $*OUT.out-buffer = False;
 
+# TODO: Killall PBS jobs when the raku is killed
+# TODO dry run
+
 our $*process-name is export;
 
 class UUID {
@@ -196,7 +199,7 @@ sub encode-job-info($proc-info is copy) {
 }
 
 
-sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-bin = "bash", :$process-name = $*process-name, :$resource = $*resource) is export {
+sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$bin = "bash", :$process-name = $*process-name, :$resource = $*resource) is export {
   my $proc-info = ($workdir, $code);
   my $job_info = encode-job-info($proc-info);
   my $cwd;
@@ -215,7 +218,7 @@ sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-
       $cwd = prepare-workdir($workdir);
       note "[$process-name] Start proc: $job_info with CWD $cwd";
       my $proc;
-      $proc = run-code($code, $cwd, $process-name, $proc-bin, $resource);
+      $proc = run-code($code, $cwd, $process-name, $bin, $resource);
 
       if $proc<exitcode> != 0 {
         note "Error happend when run: $process-name";
@@ -226,7 +229,7 @@ sub process($lock is rw, :$workdir, :$code, :$output, :$export-to = Any, :$proc-
         note $cwd;
         note "============== More =============";
         note $resource;
-        return Any;
+        Any;
       } else {
         $lock.protect({
           my %hist = ".history".IO.e ?? from-json(".history".IO.slurp) !! {};
@@ -312,9 +315,14 @@ class Processes is export {
   }
 
   multi method run($proc-name, @input = Array.new, %conf = Hash.new) {
+    # If the proc-name is not exist, report error
+    die "Invalide \$proc-name: $proc-name." unless $.proc-conf{$proc-name};
     my @input-name = %.proc-conf{$proc-name}<input>.Array;
     my %proc-conf = (%.proc-conf{$proc-name}.Hash, %conf).Hash;
-    my %input = @input-name Z=> @input;
+    # TODO: Check the type of input parameter list
+    # Check the input number
+    die "Input arguments number isn't correct." unless @input.elems == @input-name.elems;
+    my %input = @input-name ?? (@input-name Z=> @input) !! Hash.new;
     # say @input-name;
 
     self!run-process(%proc-conf, %input);
@@ -352,7 +360,7 @@ class Processes is export {
       workdir      => %proc-conf<workdir>      || %.global-conf<workdir>,
       code         => $code,
       output       => $output                  || Any,
-      proc-bin     => %proc-conf<proc-bin>     || %.global-conf<proc-bin> || 'bash',
+      bin          => %proc-conf<bin>          || %.global-conf<bin> || 'bash',
       resource     => %proc-conf<resource>     || %.global-conf<resource>,
       process-name => %proc-conf<process-name>,
       export-to    => $export-to
